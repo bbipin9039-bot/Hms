@@ -27,10 +27,11 @@ docker compose up --build
 - Console: <http://localhost:3000>
 - API docs: <http://localhost:8080/swagger-ui.html>
 
-Sign in as `admin`, `lh_warden`, `mh_warden`, or a student such as `asha.rao`,
-using whatever you set as `DEV_SEED_PASSWORD`. Leave that variable empty and no
-accounts are created at all — there is no hardcoded fallback password anywhere in
-the codebase.
+Sign in as `admin`, `lh_warden`, `mh_warden`, or one of 24 students such as
+`asha.rao`, using whatever you set as `DEV_SEED_PASSWORD`. With the `dev` profile,
+those accounts and dashboard-ready sample records are seeded idempotently. Leave
+that variable empty and no demo data is created at all — there is no hardcoded
+fallback password anywhere in the codebase.
 
 Running the two halves directly instead: [`backend`](backend) needs a Postgres and
 the environment variables in `.env.example`; [`frontend/README.md`](frontend/README.md)
@@ -42,7 +43,7 @@ covers the console, including the one setting that trips everybody up
 ## Layout
 
 ```
-backend/     Spring Boot — 187 source files, 24 controllers, 72 endpoints
+backend/     Spring Boot — 189 source files, 26 controllers, 72 endpoints
 frontend/    Next.js App Router — 28 routes, 46 source files
 docs/        concurrency.md
 ```
@@ -60,6 +61,7 @@ production start.
 **Concurrency is enforced by the database, never by a check in Java.** A read
 followed by a write is two statements, and the gap between them is where the bug
 lives. So bed allocation takes a `SELECT ... FOR UPDATE` on the room; payment
+settlement takes one on the attempt and then on the invoice, in that order; payment
 idempotency rests on `uq_fee_payments_idempotency` rather than on the lookup that
 precedes it; the absence scan is idempotent because it is a function of the
 attendance register rather than of its own history. Each choice — including the two
@@ -95,19 +97,26 @@ with consequences — argued in `frontend/src/lib/session.ts`.
 
 | | |
 | --- | --- |
-| Unit | **231**, passing (`cd backend && ./mvnw test`) |
-| Integration | **126** executions across 8 classes — run in CI, never on this machine |
+| Unit | **232**, passing (`cd backend && ./mvnw test`) |
+| Integration | **127** executions across 8 classes, passing (`cd backend && ./mvnw verify`) |
 
-The integration tests need a Docker daemon for Testcontainers, and the machine this
-was written on does not have one, so they have still never run locally. They compile
-(`./mvnw test-compile`), and `.github/workflows/ci.yml` is where they actually
-execute — which is a large part of why that file exists.
+The integration tests need a Docker daemon for Testcontainers. One is available as of
+2026-08-31, so they now run locally as well as in `.github/workflows/ci.yml`; the full
+`verify` is green there — 232 unit and 127 integration executions, 0 failures, 0 errors,
+against `postgres:16.4-alpine`. CI is still the gate on pull requests.
 
 That first real run earned its keep: it found three production defects that a fully green
 unit suite had all missed — 229 tests at that commit, all passing — because every one of
 them lives in behaviour a mock cannot have: an entity/DDL type mismatch, and two
 transactions whose rollback semantics were wrong. All three are fixed and a second CI run
 confirms it; `docs/concurrency.md` §6 has the detail.
+
+The last of the 127 to be proven was `concurrentRedeliveriesOfAPartPaymentCreditTheInvoiceOnce`,
+which arrived with the §3 fix on 2026-08-27, after the last CI run, and first executed on
+2026-08-31. It also got the check a concurrency test actually needs: with the attempt lock
+removed it fails, crediting a 22,500-paise part payment twice against a 45,000-paise invoice.
+That is what makes its green result mean something — `docs/concurrency.md` §"What is actually
+verified" has the output.
 
 ```bash
 cd backend && ./mvnw verify   # unit (surefire) + integration (failsafe) — needs Docker
@@ -125,16 +134,11 @@ that matter — they are the only executable evidence for the claims in
 
 Stated rather than discovered later:
 
-- **`PaymentService.settle` can double-credit a partial payment** when two
-  callbacks for one attempt arrive together. Real, understood, reproducible on
-  paper, and deliberately still open — with the mechanism and three candidate
-  fixes written out in [`docs/concurrency.md`](docs/concurrency.md#the-open-defect).
-  The concurrent partial case is **not** asserted by a test, because committing a
-  knowingly-failing test invites the next person to delete it rather than read it.
-- **The integration suite runs only in CI**, never on the machine it was written on.
-  Its first run found three production defects — see
-  [`docs/concurrency.md`](docs/concurrency.md) §6 — all three since confirmed fixed by a
-  second run.
+- **The integration suite's first run found three production defects** — see
+  [`docs/concurrency.md`](docs/concurrency.md) §6 — all three since confirmed fixed. It
+  ran in CI only until 2026-08-31; it now also runs locally, where `mvnw verify` puts 232
+  unit tests and 127 integration executions through `postgres:16.4-alpine` with 0
+  failures. CI remains the gate.
 - **No frontend tests.** The typecheck is strict and `next build` fails on a type
   error, which catches contract drift against `types.ts` and nothing about
   behaviour.

@@ -1,11 +1,11 @@
 # Concurrency
 
 Five places in this system can be hit by two requests at once in a way that matters. This
-is what each one does, why that mechanism and not the other one, and — for one of them —
-what is still wrong.
+is what each one does, why that mechanism and not the other one, and — for one of them — what
+was wrong with the first attempt.
 
-Three files in the backend cite this document by name: `Room`, `AllocationService` and
-`FeeReminder`.
+Six files in the backend cite this document by name: `Room`, `AllocationService`,
+`FeeReminder`, `HostelFee`, `FeePaymentRepository` and `PaymentService`.
 
 The short version: **every guarantee here rests on a database constraint or a database
 lock, never on a check in Java.** A read followed by a write is two statements, and the gap
@@ -102,7 +102,7 @@ attempt does not burn the key, and the student can retry with the same one.
 
 ---
 
-## 3. Payment settlement — row lock, and a known gap
+## 3. Payment settlement — two row locks, in that order
 
 **The race.** A gateway redelivers its callback, or a student's browser fires it twice.
 Crediting is read-modify-write on `hostel_fees.amount_paid_paise`: under READ COMMITTED both
@@ -110,9 +110,11 @@ transactions read the old balance and the second write loses the first. A studen
 twice sees one payment vanish from the invoice while its `fee_payments` row still says
 `SUCCEEDED`. It is §1's double-booking in a different table.
 
-**The mechanism.** `settle` verifies the signature, then takes the invoice through
-`HostelFeeRepository.findByIdForUpdate` before crediting it. Concurrent callbacks against
-one invoice serialise on that row.
+**The mechanism.** `settle` verifies the signature, then takes **two** row locks before it
+credits anything: `FeePaymentRepository.findByIdForUpdate` on the attempt, then
+`HostelFeeRepository.findByIdForUpdate` on the invoice. Concurrent callbacks for one attempt
+serialise on the first; concurrent callbacks for different attempts against one invoice
+serialise on the second.
 
 **What happens when the invoice cannot absorb the payment.** `HostelFee.applyPayment` throws
 rather than overshooting. The `fee_payments` row is then left `PENDING` — deliberately not
@@ -120,15 +122,15 @@ rather than overshooting. The `fee_payments` row is then left `PENDING` — deli
 has not. A `PENDING` row carrying a provider payment reference against a settled invoice is
 the state that needs a human and a refund, and it is logged at `ERROR`.
 
-### The open defect
+### Why two locks, and not one
 
-> **`settle` can double-credit a *partial* payment under concurrent callback redelivery.**
-> Found 2026-08-25 by reading the method. Raised with the project owner, deferred, still
-> unfixed as of 2026-08-26.
+> **This was an open defect for two days.** Found 2026-08-25 by reading the method, raised,
+> deferred, fixed 2026-08-27. The trace below is what it did, kept because the reasoning is
+> the reason the second lock exists.
 
-The fee lock serialises the two transactions; it does not stop either from proceeding.
-`findByIdForUpdate` locks the **fee**, not the **payment**, and `FeePayment` has no
-`@Version`. So with a 10 000-paise invoice and one `PENDING` payment of 5 000:
+The fee lock serialises the two transactions; on its own it does not stop either from
+proceeding. `FeePayment` has no `@Version`, so with a 10 000-paise invoice and one `PENDING`
+payment of 5 000 the invoice lock alone gave this:
 
 1. Both callbacks read the `fee_payments` row as `PENDING` and both pass the
    `payment.getStatus().isSettled()` guard.
@@ -139,29 +141,77 @@ The fee lock serialises the two transactions; it does not stop either from proce
    copy**, which still says `PENDING`, so it passes. Hibernate's
    `UPDATE ... WHERE id = ?` overwrites T1's row.
 
-The invoice is now marked fully paid on the strength of one 5 000-paise payment.
+The invoice ends up marked fully paid on the strength of one 5 000-paise payment.
 
-A **full-amount** payment is protected, but only incidentally: `applyPayment` refuses to
-overshoot, so the second credit fails the balance check. `uq_fee_payments_provider_ref`
-cannot help, because both writes target the same row id.
+A **full-amount** payment was protected throughout, but only incidentally: `applyPayment`
+refuses to overshoot, so the second credit failed the balance check. That incidental
+protection is exactly why the defect survived a passing test suite — see "the shape of the
+test" below. `uq_fee_payments_provider_ref` could not help either, because both writes target
+the same row id.
 
-Three candidate fixes, all in main code:
+Three candidate fixes were written down. The first was taken:
 
-| Fix | Schema change? |
-| --- | --- |
-| Add `findByIdForUpdate` on `FeePayment` and lock the payment row too | No |
-| Add `@Version` to `FeePayment` | Yes — needs a column |
-| Reorder so the payment lock is taken before the fee lock | No |
+| Fix | Schema change? | |
+| --- | --- | --- |
+| Add `findByIdForUpdate` on `FeePayment` and lock the payment row too | No | **taken** |
+| Add `@Version` to `FeePayment` | Yes — needs a column | rejected: the schema is frozen |
+| Reorder so the payment lock is taken before the fee lock | No | that is the same fix; the ordering is part of it |
 
-The first is the smallest correct change and respects the frozen schema.
+`@Version` would also be the wrong shape here even with a free hand at the schema. Optimistic
+locking hands the loser an exception to retry, and a redelivered callback does not want a
+retry — it wants a 409. The pessimistic lock lets the loser read the winner's committed row
+and answer `PAYMENT_ALREADY_SETTLED`, which is a true statement about the payment rather than
+a request to try again.
 
-**What the test suite says about this — and what it does not.**
-`concurrentRedeliveriesCreditTheInvoiceOnce` races six redeliveries of a *full-amount*
-payment and asserts one 200 against five 409s, which is the guarantee that actually holds.
-`partPaymentsAddUp` proves the partial path *sequentially*. The concurrent
-partial case is documented in the class Javadoc and **deliberately not asserted**: a
-knowingly-failing committed test is worse than a written-down finding, because the next
-person deletes it instead of reading it.
+### The part that is not obvious
+
+**Locking the row is not the same as reading it under the lock,** and getting this wrong
+leaves the defect in place with a `FOR UPDATE` sitting on top of it.
+
+`settle` used to resolve the callback by loading the `FeePayment` entity by order reference.
+Adding `payments.findByIdForUpdate(payment.getId())` after that does nothing for freshness:
+Hibernate finds the id already in the persistence context, returns **the instance it already
+has**, and throws away the row state its own `SELECT ... FOR UPDATE` just returned. T2 would
+block on the lock, wait for T1 to commit, acquire the lock, and then evaluate
+`isSettled()` against the copy it read before T1 committed. Both transactions still pass the
+guard, the second still overwrites the first, and the code now *looks* correct.
+
+So the entity's first and only read has to be the locked one. The callback is resolved instead
+through `findAttemptRefsByProviderOrderId`, a JPQL constructor expression returning
+`FeePaymentAttemptRef(id, provider)` — two scalars, nothing managed. That leaves the session
+empty until `findByIdForUpdate`, whose read is therefore the one the guard sees, and Postgres'
+EvalPlanQual re-read hands it the winner's committed `SUCCEEDED`.
+
+Reading scalars first also preserves the security ordering that was already there: the
+provider comes off the stored row, so the caller cannot choose whose secret verifies their
+signature, and the signature is checked **before** any lock is taken — a forged callback
+cannot make real ones queue behind it. Putting `@Lock` on the order-reference finder would
+have been fewer lines and would have given that up.
+
+**Lock ordering.** Attempt, then invoice, always. Nothing else in the codebase takes both, so
+there is no cycle to deadlock on today; the ordering is written down in `PaymentService`'s
+class Javadoc so that a future caller needing both takes them the same way round.
+
+### The shape of the test, which is the other half of the lesson
+
+`concurrentRedeliveriesCreditTheInvoiceOnce` races six redeliveries of a *full-amount* payment
+and asserts one 200 against five 409s. It passed for as long as the defect existed, and it was
+not a bad test — it just could not see this bug, because `applyPayment`'s overshoot refusal
+does its work for it. A green test over a case with two protections tells you at least one of
+them holds, and never which.
+
+`concurrentRedeliveriesOfAPartPaymentCreditTheInvoiceOnce` is the fixture with no accidental
+help: half an invoice leaves room, so the domain model has no objection and the lock is the
+only thing left. It asserts the invoice holds exactly `HALF`, is `PARTIALLY_PAID`, carries one
+`SUCCEEDED` row, and returned one 200 and five `PAYMENT_ALREADY_SETTLED` — and, last, that the
+remaining half is still payable afterwards, since a fix that deadlocked the student out of
+finishing would be worse than the bug. Traced against the old code it fails on its first
+assertion.
+
+It was not committed while the defect stood open, on the reasoning in rule of thumb 6: a
+knowingly-failing committed test teaches the next person to delete it rather than read it. It
+is committed now that it is expected to pass — and "expected" is the honest word, because it
+needs Docker and has not run yet. See the verification table below.
 
 ---
 
@@ -272,14 +322,17 @@ an enum constant, queried a `decided_by_id` column that does not exist (it is `d
 and expected a username where the response carries a display name.
 
 **6.5 A fourth test-side mistake, found by the second run.** `applyingCreatesAPendingApplication`
-asserted `path("decidedAt").isNull()` on a pending application. The app serialises with
-`default-property-inclusion: non_null`, so an undecided application omits `decidedAt`
-altogether rather than sending it as `null` — `path` returns a `MissingNode`, whose `isNull()`
-is `false`. Its sibling in `approvalAllocates` asserted the same predicate was `isFalse()`
-and so passed for the wrong reason: a missing field would have satisfied it just as well as a
-real timestamp, which is the one thing that assertion existed to rule out. Both now use
-`hasNonNull`, which asks whether there is a decision timestamp rather than what Jackson does
-with absent ones.
+asserted `path("decidedAt").isNull()` on a pending application. The app serialised with
+`default-property-inclusion: non_null` at the time, so an undecided application omitted
+`decidedAt` altogether rather than sending it as `null` — `path` returns a `MissingNode`,
+whose `isNull()` is `false`. Its sibling in `approvalAllocates` asserted the same predicate
+was `isFalse()` and so passed for the wrong reason: a missing field would have satisfied it
+just as well as a real timestamp, which is the one thing that assertion existed to rule out.
+Both now use `hasNonNull`, which asks whether there is a decision timestamp rather than what
+Jackson does with absent ones. That inclusion setting is `always` as of 2026-08-31:
+omitting a key the TypeScript contract declares as `T | null` is invisible to `tsc` and
+false to a `=== null` guard, which crashed the student landing page on the next line. Both
+assertions were already written not to care which shape arrives, and neither changed.
 
 **What the second run said.** CI run #4 (2026-08-27) put the same 126 executions through the
 fixed tree and 125 passed. All three production defects are confirmed fixed by a real run,
@@ -295,27 +348,46 @@ lone failure was §6.5, above.
 | Claim | Test | Has it run? |
 | --- | --- | --- |
 | Allocation cannot over-fill a room | `AllocationConcurrencyIT` (7 tests) | **Yes — 7/7, CI run #4** |
-| Initiation cannot double-charge | `PaymentCallbackIT` (14 tests) | **Yes — 14/14, CI run #4** |
+| Initiation cannot double-charge | `PaymentCallbackIT` | **Yes — 14/14, CI run #4** |
 | Full-amount settlement is race-safe | `PaymentCallbackIT` | **Yes — same run** |
-| Partial settlement is race-safe | *not asserted — see §3* | — |
+| Partial settlement is race-safe | `PaymentCallbackIT` (added 2026-08-27) | **Yes — locally, 2026-08-31, and negatively controlled** |
 | Reminders are once per invoice per day | `FeeReminderIdempotencyIT` (9 tests) | **Yes — 9/9, CI run #4** |
 | The absence scan converges | `AbsenceScanIdempotencyIT` (8 tests) | **Yes — 8/8, CI run #4** |
 
-Run #4 rather than run #3 for all of them: run #3 executed against a tree carrying the three
-defects in §6, so run #4 is the first result that describes the code as it now stands.
+Run #4 rather than run #3 for the first three: run #3 executed against a tree carrying the
+three defects in §6, so run #4 is the first result that describes the code as it then stood.
 
-**The integration suite has now executed twice, both times in CI.** It needs Docker for
-Testcontainers and the machine this was built on has none, so
-`.github/workflows/ci.yml` is where these six claims get their only real run. Run #3 put 126
-executions through a real PostgreSQL and 45 failed, reducing to four root causes: three
-production defects and a set of test-side mistakes, all set out in §6. Run #4 re-ran the same
-126 against the fixed tree and 125 passed, the one failure being a fourth test-side mistake
-(§6.5). The 231 unit tests pass alongside them (`mvnw test`, 0 failures, 0 errors, verified
-2026-08-27).
+**The integration suite has now executed three times: twice in CI, then once locally.**
+Run #3 put 126 executions through a real PostgreSQL and 45 failed, reducing to four root
+causes: three production defects and a set of test-side mistakes, all set out in §6. Run #4
+re-ran the same 126 against the fixed tree and 125 passed, the one failure being a fourth
+test-side mistake (§6.5). On 2026-08-31 a Docker daemon became available on the development
+machine, and `mvnw verify` ran the whole tree there: 232 unit tests and 127 integration
+executions, 0 failures and 0 errors, against `postgres:16.4-alpine`. CI is still the gate,
+but it is no longer the only place these claims can be tested.
 
-Every claim above that is asserted at all now carries a real result. The one dash is §3's
-concurrent partial settlement, which is unasserted on purpose and stays that way until the
-defect itself is fixed.
+**The newest row has now run, and it was checked the other way round as well.** §3's
+attempt lock landed on 2026-08-27, after run #4, and it brought
+`concurrentRedeliveriesOfAPartPaymentCreditTheInvoiceOnce` with it — 127 executions now
+rather than 126. The local run of 2026-08-31 executed it against a real PostgreSQL and it
+passed.
+
+A green test is weak evidence on its own, and this document says so about §6: run #3 was
+green on the full-amount race while the partial-settlement defect was live, because
+`HostelFee.applyPayment` refuses to overshoot and so protected that case incidentally. The
+new test was therefore negatively controlled. Replacing the locking read in `settle` with the
+unlocked `payments.findById(attempt.id())` — the shape of the code before the fix, invoice
+lock still in place — makes it fail exactly as §3's trace predicts:
+
+```
+[paise credited to invoice 1 by 6 simultaneous callbacks for one 2250000-paise attempt]
+expected: 2250000L
+ but was: 4500000L
+```
+
+Half the invoice credited twice, one 22,500-paise payment settling a 45,000-paise invoice in
+full. Restoring `findByIdForUpdate` returns the class to 15/15. So the assertion is
+load-bearing rather than incidentally true, and the §3 fix is proven rather than argued.
 
 ---
 
@@ -331,6 +403,8 @@ defect itself is fixed.
    by marker, when the data can support it.
 5. **Report counters, not "ok."** `examined / done / skipped / failed` is what makes a
    repeated run legible.
-6. **A known defect written down beats a failing test committed.** §3 is unfixed on purpose
-   and says so in three places: here, the `PaymentCallbackIT` Javadoc, and the frontend page
-   that takes the payment.
+6. **A known defect written down beats a failing test committed** — and the test goes in the
+   moment the defect goes out. §3 stood open for two days in three places, and the fixture
+   that proves it fixed was written before the fix and held back until it passed.
+7. **A lock is only as good as the read that carries it.** If the row is already in the
+   session, `FOR UPDATE` buys serialisation and nothing else — §3.
